@@ -55,6 +55,15 @@ class TerminalExecuteRequest(BaseModel):
     command: str
 
 
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+
+
+class MkdirRequest(BaseModel):
+    path: str
+
+
 # ===== Terminal Session =====
 
 class TerminalSession:
@@ -66,6 +75,7 @@ class TerminalSession:
         self.max_history = 2000
         self._running = False
         self._read_task = None
+        self._save_task = None
 
     def start(self):
         if self._running:
@@ -97,6 +107,50 @@ class TerminalSession:
     async def start_reading(self):
         if self._read_task is None or self._read_task.done():
             self._read_task = asyncio.create_task(self._read_loop())
+        if self._save_task is None or self._save_task.done():
+            self._save_task = asyncio.create_task(self._periodic_save())
+
+    async def restore_session(self):
+        """Restore terminal buffer from MongoDB on startup"""
+        try:
+            saved = await db.terminal_session.find_one({}, {"_id": 0})
+            if saved and saved.get("buffer"):
+                self.history_buffer = saved["buffer"][-self.max_history:]
+                logger.info(f"Restored terminal session ({len(self.history_buffer)} chunks)")
+        except Exception as e:
+            logger.error(f"Failed to restore session: {e}")
+
+    async def _periodic_save(self):
+        """Save terminal buffer to MongoDB every 30 seconds"""
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                if self.history_buffer:
+                    await db.terminal_session.update_one(
+                        {},
+                        {"$set": {
+                            "buffer": self.history_buffer[-self.max_history:],
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }},
+                        upsert=True,
+                    )
+            except Exception as e:
+                logger.error(f"Failed to save session: {e}")
+
+    async def save_now(self):
+        """Force save terminal buffer immediately"""
+        try:
+            if self.history_buffer:
+                await db.terminal_session.update_one(
+                    {},
+                    {"$set": {
+                        "buffer": self.history_buffer[-self.max_history:],
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }},
+                    upsert=True,
+                )
+        except Exception:
+            pass
 
     async def _read_loop(self):
         loop = asyncio.get_event_loop()
@@ -443,6 +497,150 @@ async def get_terminal_history():
     return {"history": history}
 
 
+@api_router.post("/terminal/save-session")
+async def save_terminal_session():
+    await terminal.save_now()
+    return {"message": "Session saved"}
+
+
+# ===== File Browser API =====
+
+SAFE_ROOT = "/"
+
+def safe_resolve(path: str) -> Path:
+    """Resolve path safely"""
+    resolved = Path(path).resolve()
+    blocked = ['/proc', '/sys', '/dev']
+    for b in blocked:
+        if str(resolved).startswith(b):
+            raise ValueError("Access denied to system directory")
+    return resolved
+
+
+@api_router.get("/files")
+async def list_files(path: str = "/"):
+    try:
+        resolved = safe_resolve(path)
+        if not resolved.exists():
+            return JSONResponse(status_code=404, content={"detail": "Path not found"})
+        if not resolved.is_dir():
+            return JSONResponse(status_code=400, content={"detail": "Not a directory"})
+
+        items = []
+        try:
+            entries = sorted(resolved.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except PermissionError:
+            return JSONResponse(status_code=403, content={"detail": "Permission denied"})
+
+        for entry in entries:
+            if entry.name.startswith('.') and entry.name not in ['.env', '.gitignore']:
+                continue
+            try:
+                stat = entry.stat()
+                items.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "is_dir": entry.is_dir(),
+                    "size": stat.st_size if entry.is_file() else None,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                })
+            except (PermissionError, OSError):
+                continue
+
+        parent = str(resolved.parent) if str(resolved) != "/" else None
+
+        return {"path": str(resolved), "parent": parent, "items": items}
+    except ValueError as e:
+        return JSONResponse(status_code=403, content={"detail": str(e)})
+
+
+@api_router.get("/files/read")
+async def read_file(path: str):
+    try:
+        resolved = safe_resolve(path)
+        if not resolved.exists():
+            return JSONResponse(status_code=404, content={"detail": "File not found"})
+        if not resolved.is_file():
+            return JSONResponse(status_code=400, content={"detail": "Not a file"})
+        if resolved.stat().st_size > 1024 * 512:
+            return JSONResponse(status_code=400, content={"detail": "File too large (>512KB)"})
+
+        try:
+            content = resolved.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            content = resolved.read_text(encoding='latin-1')
+
+        ext = resolved.suffix.lower()
+        lang_map = {
+            '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+            '.tsx': 'tsx', '.jsx': 'jsx', '.json': 'json', '.md': 'markdown',
+            '.html': 'html', '.css': 'css', '.sh': 'bash', '.yml': 'yaml',
+            '.yaml': 'yaml', '.toml': 'toml', '.rs': 'rust', '.go': 'go',
+            '.java': 'java', '.c': 'c', '.cpp': 'cpp', '.h': 'c',
+            '.rb': 'ruby', '.php': 'php', '.sql': 'sql', '.xml': 'xml',
+            '.env': 'bash', '.txt': 'text', '.log': 'text',
+        }
+
+        return {
+            "path": str(resolved),
+            "name": resolved.name,
+            "content": content,
+            "language": lang_map.get(ext, 'text'),
+            "size": resolved.stat().st_size,
+        }
+    except ValueError as e:
+        return JSONResponse(status_code=403, content={"detail": str(e)})
+
+
+@api_router.post("/files/write")
+async def write_file(req: FileWriteRequest):
+    try:
+        resolved = safe_resolve(req.path)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(req.content, encoding='utf-8')
+        return {
+            "message": "File saved",
+            "path": str(resolved),
+        }
+    except ValueError as e:
+        return JSONResponse(status_code=403, content={"detail": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+@api_router.post("/files/mkdir")
+async def create_directory(req: MkdirRequest):
+    try:
+        resolved = safe_resolve(req.path)
+        resolved.mkdir(parents=True, exist_ok=True)
+        return {
+            "message": "Directory created",
+            "path": str(resolved),
+        }
+    except ValueError as e:
+        return JSONResponse(status_code=403, content={"detail": str(e)})
+
+
+@api_router.delete("/files")
+async def delete_file(path: str):
+    try:
+        resolved = safe_resolve(path)
+        if not resolved.exists():
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+        if resolved.is_dir():
+            import shutil
+            shutil.rmtree(resolved)
+        else:
+            resolved.unlink()
+
+        return {"message": "Deleted", "path": path}
+    except ValueError as e:
+        return JSONResponse(status_code=403, content={"detail": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
 # ===== Terminal HTML (for web iframe) =====
 
 @api_router.get("/terminal-html", response_class=HTMLResponse)
@@ -603,9 +801,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     logger.info("TermuxAI backend starting...")
+    await terminal.restore_session()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await terminal.save_now()
     terminal.stop()
     client.close()

@@ -45,6 +45,15 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="files"
+        options={{
+          title: 'Files',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="folder-open" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
         name="settings"
         options={{
           title: 'Settings',
