@@ -1,58 +1,594 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import json
+import pty
+import fcntl
+import struct
+import termios
+import select
+import signal
+import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 import uuid
-from datetime import datetime
-
+from datetime import datetime, timezone
+import httpx
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
 app = FastAPI()
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+# ===== Models =====
 
-# Add your routes to the router instead of directly to app
+class AppConfigCreate(BaseModel):
+    provider: str
+    api_key: str
+    endpoint: str
+    model: str
+    agent_name: Optional[str] = "TermuxAI"
+    system_prompt: Optional[str] = ""
+    theme: str = "cyberpunk_void"
+    auto_execute: bool = False
+
+
+class ChatMessageCreate(BaseModel):
+    content: str
+
+
+class TerminalExecuteRequest(BaseModel):
+    command: str
+
+
+# ===== Terminal Session =====
+
+class TerminalSession:
+    def __init__(self):
+        self.master_fd = None
+        self.pid = None
+        self.clients: set = set()
+        self.history_buffer: List[str] = []
+        self.max_history = 2000
+        self._running = False
+        self._read_task = None
+
+    def start(self):
+        if self._running:
+            return
+        self.master_fd, slave_fd = pty.openpty()
+        winsize = struct.pack('HHHH', 30, 120, 0, 0)
+        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+
+        self.pid = os.fork()
+        if self.pid == 0:
+            os.close(self.master_fd)
+            os.setsid()
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+            env = os.environ.copy()
+            env['TERM'] = 'xterm-256color'
+            env['HOME'] = '/root'
+            os.execvpe('/bin/bash', ['/bin/bash', '--login'], env)
+        else:
+            os.close(slave_fd)
+            flags = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            self._running = True
+
+    async def start_reading(self):
+        if self._read_task is None or self._read_task.done():
+            self._read_task = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self):
+        loop = asyncio.get_event_loop()
+        while self._running:
+            try:
+                data = await loop.run_in_executor(None, self._read)
+                if data:
+                    text = data.decode('utf-8', errors='replace')
+                    self.history_buffer.append(text)
+                    if len(self.history_buffer) > self.max_history:
+                        self.history_buffer = self.history_buffer[-self.max_history:]
+                    disconnected = set()
+                    for ws in self.clients:
+                        try:
+                            await ws.send_text(text)
+                        except Exception:
+                            disconnected.add(ws)
+                    self.clients -= disconnected
+            except Exception:
+                if self._running:
+                    await asyncio.sleep(0.01)
+
+    def _read(self):
+        try:
+            r, _, _ = select.select([self.master_fd], [], [], 0.1)
+            if r:
+                return os.read(self.master_fd, 4096)
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def write(self, data: str):
+        if self.master_fd is not None:
+            try:
+                os.write(self.master_fd, data.encode('utf-8'))
+            except OSError:
+                pass
+
+    def resize(self, rows: int, cols: int):
+        if self.master_fd is not None:
+            try:
+                winsize = struct.pack('HHHH', rows, cols, 0, 0)
+                fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            except OSError:
+                pass
+
+    def get_history(self, chars=5000):
+        history = ''.join(self.history_buffer)
+        return history[-chars:] if len(history) > chars else history
+
+    def stop(self):
+        self._running = False
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+                os.waitpid(self.pid, os.WNOHANG)
+            except Exception:
+                pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except Exception:
+                pass
+
+
+terminal = TerminalSession()
+
+
+# ===== AI Provider =====
+
+async def call_ai_provider(config: dict, messages: list) -> str:
+    provider = config['provider']
+    api_key = config['api_key']
+    endpoint = config['endpoint']
+    model = config['model']
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as http_client:
+            if provider in ['openai', 'openai_compatible']:
+                headers = {
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json'
+                }
+                payload = {
+                    'model': model,
+                    'messages': messages,
+                    'max_tokens': 4096
+                }
+                response = await http_client.post(endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                return data['choices'][0]['message']['content']
+
+            elif provider == 'anthropic':
+                headers = {
+                    'x-api-key': api_key,
+                    'anthropic-version': '2023-06-01',
+                    'Content-Type': 'application/json'
+                }
+                system_msg = None
+                chat_msgs = []
+                for m in messages:
+                    if m['role'] == 'system':
+                        system_msg = m['content']
+                    else:
+                        chat_msgs.append({'role': m['role'], 'content': m['content']})
+                payload = {
+                    'model': model,
+                    'messages': chat_msgs,
+                    'max_tokens': 4096
+                }
+                if system_msg:
+                    payload['system'] = system_msg
+                response = await http_client.post(endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                return data['content'][0]['text']
+
+            elif provider == 'google':
+                url = f"{endpoint}/models/{model}:generateContent?key={api_key}"
+                system_msg = None
+                contents = []
+                for m in messages:
+                    if m['role'] == 'system':
+                        system_msg = m['content']
+                    else:
+                        role = 'user' if m['role'] == 'user' else 'model'
+                        contents.append({'role': role, 'parts': [{'text': m['content']}]})
+                payload = {'contents': contents}
+                if system_msg:
+                    payload['systemInstruction'] = {'parts': [{'text': system_msg}]}
+                response = await http_client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data['candidates'][0]['content']['parts'][0]['text']
+
+            elif provider == 'generic':
+                headers = {'Content-Type': 'application/json'}
+                if api_key:
+                    headers['Authorization'] = f'Bearer {api_key}'
+                payload = {'messages': messages}
+                if model:
+                    payload['model'] = model
+                response = await http_client.post(endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                    if 'choices' in data:
+                        return data['choices'][0]['message']['content']
+                    elif 'content' in data:
+                        if isinstance(data['content'], list):
+                            return data['content'][0]['text']
+                        return data['content']
+                    else:
+                        return json.dumps(data)
+                except Exception:
+                    return response.text
+            else:
+                raise Exception(f"Unknown provider: {provider}")
+
+    except httpx.HTTPStatusError as e:
+        raise Exception(f"AI API error ({e.response.status_code}): {e.response.text[:500]}")
+    except Exception as e:
+        if "AI API error" in str(e):
+            raise
+        raise Exception(f"AI provider error: {str(e)}")
+
+
+def parse_code_blocks(text: str) -> List[str]:
+    commands = []
+    in_block = False
+    current_block = []
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('```bash') or stripped.startswith('```shell') or stripped.startswith('```sh'):
+            in_block = True
+            current_block = []
+        elif stripped == '```' and in_block:
+            in_block = False
+            if current_block:
+                commands.append('\n'.join(current_block))
+        elif in_block:
+            current_block.append(line)
+    return commands
+
+
+# ===== API Routes =====
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "TermuxAI API", "version": "1.0.0"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+@api_router.get("/config")
+async def get_config():
+    config = await db.config.find_one({}, {"_id": 0})
+    if not config:
+        return JSONResponse(status_code=404, content={"detail": "No configuration found"})
+    return {
+        "id": config.get("id", ""),
+        "provider": config.get("provider", ""),
+        "endpoint": config.get("endpoint", ""),
+        "model": config.get("model", ""),
+        "agent_name": config.get("agent_name", "TermuxAI"),
+        "system_prompt": config.get("system_prompt", ""),
+        "theme": config.get("theme", "cyberpunk_void"),
+        "auto_execute": config.get("auto_execute", False),
+        "has_api_key": bool(config.get("api_key", "")),
+        "created_at": config.get("created_at", ""),
+        "updated_at": config.get("updated_at", ""),
+    }
 
-# Include the router in the main app
+
+@api_router.post("/config")
+async def save_config(config_data: AppConfigCreate):
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await db.config.find_one({}, {"_id": 0})
+    config_dict = config_data.dict()
+    config_dict["updated_at"] = now
+
+    # Preserve existing API key if not provided or placeholder
+    if existing and config_dict.get("api_key") in ["", "UNCHANGED", "EXISTING_KEY_PLACEHOLDER"]:
+        config_dict["api_key"] = existing.get("api_key", "")
+
+    if existing:
+        config_dict["id"] = existing.get("id", str(uuid.uuid4()))
+        config_dict["created_at"] = existing.get("created_at", now)
+        await db.config.update_one({}, {"$set": config_dict})
+    else:
+        config_dict["id"] = str(uuid.uuid4())
+        config_dict["created_at"] = now
+        await db.config.insert_one(config_dict)
+
+    return {
+        "id": config_dict["id"],
+        "provider": config_dict["provider"],
+        "endpoint": config_dict["endpoint"],
+        "model": config_dict["model"],
+        "agent_name": config_dict["agent_name"],
+        "system_prompt": config_dict["system_prompt"],
+        "theme": config_dict["theme"],
+        "auto_execute": config_dict["auto_execute"],
+        "has_api_key": bool(config_dict["api_key"]),
+        "created_at": config_dict["created_at"],
+        "updated_at": config_dict["updated_at"],
+    }
+
+
+@api_router.post("/chat")
+async def chat(message: ChatMessageCreate):
+    config = await db.config.find_one({}, {"_id": 0})
+    if not config:
+        return JSONResponse(status_code=400, content={"detail": "AI not configured"})
+
+    user_msg_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    user_msg = {"id": user_msg_id, "role": "user", "content": message.content, "timestamp": now}
+    await db.chat_history.insert_one({**user_msg})
+
+    terminal_history = terminal.get_history(3000) if terminal._running else "(Terminal not active)"
+    agent_name = config.get("agent_name", "TermuxAI")
+    custom_prompt = config.get("system_prompt", "")
+
+    system_content = f"""You are {agent_name}, an AI coding assistant with full access to a Linux terminal.
+
+{custom_prompt}
+
+CURRENT TERMINAL OUTPUT (last activity):
+```
+{terminal_history}
+```
+
+When you want to run a command in the terminal, put it in a bash code block:
+```bash
+command here
+```
+
+Be concise. Help with coding, debugging, installations, and system tasks."""
+
+    recent_msgs = await db.chat_history.find({}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(20)
+    recent_msgs.reverse()
+
+    messages = [{"role": "system", "content": system_content}]
+    for msg in recent_msgs:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    try:
+        ai_response = await call_ai_provider(config, messages)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+    executed_commands = []
+    if config.get("auto_execute", False):
+        commands = parse_code_blocks(ai_response)
+        for cmd in commands:
+            terminal.write(cmd + '\n')
+            executed_commands.append(cmd)
+            await asyncio.sleep(0.2)
+
+    assistant_msg_id = str(uuid.uuid4())
+    assistant_msg = {
+        "id": assistant_msg_id,
+        "role": "assistant",
+        "content": ai_response,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "executed_commands": executed_commands if executed_commands else None,
+    }
+    await db.chat_history.insert_one({**assistant_msg})
+
+    return {
+        "id": assistant_msg_id,
+        "role": "assistant",
+        "content": ai_response,
+        "timestamp": assistant_msg["timestamp"],
+        "executed_commands": executed_commands if executed_commands else None,
+    }
+
+
+@api_router.get("/chat/history")
+async def get_chat_history():
+    messages = await db.chat_history.find({}, {"_id": 0}).sort("timestamp", 1).to_list(200)
+    return messages
+
+
+@api_router.delete("/chat/history")
+async def clear_chat_history():
+    await db.chat_history.delete_many({})
+    return {"message": "Chat history cleared"}
+
+
+@api_router.post("/terminal/execute")
+async def execute_terminal_command(req: TerminalExecuteRequest):
+    if not terminal._running:
+        terminal.start()
+        await terminal.start_reading()
+        await asyncio.sleep(0.5)
+    terminal.write(req.command + '\n')
+    return {"message": "Command sent", "command": req.command}
+
+
+@api_router.get("/terminal/history")
+async def get_terminal_history():
+    history = terminal.get_history(5000) if terminal._running else ""
+    return {"history": history}
+
+
+# ===== Terminal HTML (for web iframe) =====
+
+@api_router.get("/terminal-html", response_class=HTMLResponse)
+async def terminal_html(request: Request):
+    """Serve terminal HTML for web iframe fallback"""
+    config = await db.config.find_one({}, {"_id": 0})
+    theme_name = config.get("theme", "cyberpunk_void") if config else "cyberpunk_void"
+
+    terminal_themes = {
+        "cyberpunk_void": {"background":"#050505","foreground":"#00FF9C","cursor":"#00FF9C","cursorAccent":"#050505","selectionBackground":"rgba(0,255,156,0.3)","black":"#050505","red":"#FF0055","green":"#00FF9C","yellow":"#FFD60A","blue":"#64D2FF","magenta":"#FF79C6","cyan":"#00FFFF","white":"#E0E0E0","brightBlack":"#808080","brightRed":"#FF4488","brightGreen":"#33FFAA","brightYellow":"#FFE033","brightBlue":"#88DDFF","brightMagenta":"#FF99DD","brightCyan":"#33FFFF","brightWhite":"#FFFFFF"},
+        "monokai_pro": {"background":"#2D2A2E","foreground":"#FCFCFA","cursor":"#FFD866","cursorAccent":"#2D2A2E","selectionBackground":"rgba(255,216,102,0.3)","black":"#2D2A2E","red":"#FF6188","green":"#A9DC76","yellow":"#FFD866","blue":"#78DCE8","magenta":"#AB9DF2","cyan":"#78DCE8","white":"#FCFCFA","brightBlack":"#727072","brightRed":"#FF6188","brightGreen":"#A9DC76","brightYellow":"#FFD866","brightBlue":"#78DCE8","brightMagenta":"#AB9DF2","brightCyan":"#78DCE8","brightWhite":"#FFFFFF"},
+        "dracula": {"background":"#282A36","foreground":"#F8F8F2","cursor":"#BD93F9","cursorAccent":"#282A36","selectionBackground":"rgba(189,147,249,0.3)","black":"#21222C","red":"#FF5555","green":"#50FA7B","yellow":"#F1FA8C","blue":"#BD93F9","magenta":"#FF79C6","cyan":"#8BE9FD","white":"#F8F8F2","brightBlack":"#6272A4","brightRed":"#FF6E6E","brightGreen":"#69FF94","brightYellow":"#FFFFA5","brightBlue":"#D6ACFF","brightMagenta":"#FF92DF","brightCyan":"#A4FFFF","brightWhite":"#FFFFFF"},
+    }
+    t = terminal_themes.get(theme_name, terminal_themes["cyberpunk_void"])
+    bg = t["background"]
+    theme_json = json.dumps(t)
+
+    html = f"""<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{width:100%;height:100%;overflow:hidden;background:{bg}}}
+#terminal{{width:100%;height:100%}}
+.xterm{{padding:4px}}
+.xterm-viewport::-webkit-scrollbar{{width:6px}}
+.xterm-viewport::-webkit-scrollbar-thumb{{background:#555;border-radius:3px}}
+#status{{position:fixed;top:4px;right:8px;color:{t["foreground"]};font-size:11px;font-family:monospace;opacity:0.6;z-index:999}}
+</style>
+</head><body>
+<div id="terminal"></div>
+<div id="status">Loading...</div>
+<script>
+var THEME={theme_json};
+var statusEl=document.getElementById('status');
+function setStatus(s){{if(statusEl)statusEl.textContent=s}}
+function loadScript(url){{
+  return new Promise(function(resolve,reject){{
+    var s=document.createElement('script');
+    s.src=url;s.onload=resolve;s.onerror=reject;
+    document.head.appendChild(s);
+  }});
+}}
+function loadCSS(url){{
+  var l=document.createElement('link');
+  l.rel='stylesheet';l.href=url;
+  document.head.appendChild(l);
+}}
+loadCSS('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css');
+setStatus('Loading xterm...');
+loadScript('https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js').then(function(){{
+  return loadScript('https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js');
+}}).then(function(){{
+  setStatus('Initializing...');
+  var term=new Terminal({{
+    cursorBlink:true,fontSize:14,fontFamily:'Menlo,Monaco,Consolas,monospace',
+    theme:THEME,allowProposedApi:true,scrollback:5000,
+    rows:24,cols:80
+  }});
+  var fitAddon=null;
+  try{{fitAddon=new FitAddon.FitAddon();term.loadAddon(fitAddon)}}catch(e){{}}
+  term.open(document.getElementById('terminal'));
+  if(fitAddon)try{{fitAddon.fit()}}catch(e){{}}
+  var proto=location.protocol==='https:'?'wss:':'ws:';
+  var wsUrl=proto+'//'+location.host+'/api/ws/terminal';
+  setStatus('Connecting...');
+  var ws;
+  function connect(){{
+    ws=new WebSocket(wsUrl);
+    ws.onopen=function(){{
+      setStatus('Connected');
+      setTimeout(function(){{if(statusEl)statusEl.style.display='none'}},2000);
+      var dims={{rows:term.rows,cols:term.cols}};
+      ws.send(JSON.stringify({{type:'resize',rows:dims.rows,cols:dims.cols}}));
+    }};
+    ws.onmessage=function(e){{term.write(e.data)}};
+    ws.onclose=function(){{
+      setStatus('Reconnecting...');
+      if(statusEl)statusEl.style.display='block';
+      term.write('\\r\\n\\x1b[33m[Reconnecting...]\\x1b[0m\\r\\n');
+      setTimeout(connect,2000);
+    }};
+    ws.onerror=function(){{setStatus('Connection error')}};
+  }}
+  connect();
+  term.onData(function(data){{
+    if(ws&&ws.readyState===1)ws.send(JSON.stringify({{type:'input',data:data}}));
+  }});
+  window.addEventListener('resize',function(){{
+    if(fitAddon)try{{fitAddon.fit()}}catch(e){{}}
+    if(ws&&ws.readyState===1)ws.send(JSON.stringify({{type:'resize',rows:term.rows,cols:term.cols}}));
+  }});
+  window.addEventListener('message',function(e){{
+    try{{
+      var msg=JSON.parse(e.data);
+      if(msg.type==='write'&&ws&&ws.readyState===1){{
+        ws.send(JSON.stringify({{type:'input',data:msg.data}}));
+      }}
+    }}catch(x){{}}
+  }});
+}}).catch(function(err){{
+  setStatus('Failed to load terminal: '+err);
+  document.getElementById('terminal').innerHTML='<pre style="color:{t["foreground"]};padding:20px">Failed to load xterm.js. Check network connection.</pre>';
+}});
+</script>
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
+# ===== WebSocket =====
+
+@app.websocket("/api/ws/terminal")
+async def websocket_terminal(websocket: WebSocket):
+    await websocket.accept()
+    if not terminal._running:
+        terminal.start()
+        await terminal.start_reading()
+        await asyncio.sleep(0.3)
+
+    terminal.clients.add(websocket)
+    history = ''.join(terminal.history_buffer)
+    if history:
+        try:
+            await websocket.send_text(history)
+        except Exception:
+            pass
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get('type') == 'input':
+                    terminal.write(msg['data'])
+                elif msg.get('type') == 'resize':
+                    terminal.resize(msg.get('rows', 30), msg.get('cols', 120))
+            except json.JSONDecodeError:
+                terminal.write(data)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        terminal.clients.discard(websocket)
+
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -63,13 +599,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup():
+    logger.info("TermuxAI backend starting...")
+
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
+async def shutdown():
+    terminal.stop()
     client.close()
