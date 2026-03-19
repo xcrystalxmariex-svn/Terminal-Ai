@@ -15,6 +15,7 @@ TermuxAI is a mobile-first coding and development environment powered by an AI a
 - Special keys toolbar (ESC, TAB, CTRL, arrows) for mobile keyboard limitations
 - CTRL shortcut panel (C, D, Z, L, A, E) for common terminal operations
 - Shared terminal session between user and AI agent
+- **Session Persistence**: Terminal buffer saved to MongoDB every 30 seconds and restored on startup
 
 ### 3. AI Agent Tab
 - Chat interface with conversational AI powered by user's configured provider
@@ -23,17 +24,31 @@ TermuxAI is a mobile-first coding and development environment powered by an AI a
 - Auto-execute mode option for hands-free terminal automation
 - Chat history persistence in MongoDB
 
-### 4. Settings Tab
+### 4. File Browser Tab
+- Full filesystem navigation with breadcrumb trail
+- Directory listing with file type icons and sizes
+- File viewer with syntax-aware display
+- File editor with save functionality
+- Create new files and folders via modal dialog
+- Delete files/folders with confirmation
+- Long-press to delete
+
+### 5. Settings Tab
 - Live theme switching
 - AI provider reconfiguration
 - Agent name and system prompt editing
 - Auto-execute toggle
 - API key management (secured, shows "saved" indicator)
 
+### 6. APK Packaging
+- `eas.json` configured with development, preview (APK), and production (AAB) profiles
+- `app.json` configured with Android package name, permissions, and icons
+- Build with: `cd frontend && eas build --platform android --profile preview`
+
 ## Architecture
-- **Backend**: FastAPI with WebSocket support, PTY terminal management, AI provider proxy
+- **Backend**: FastAPI with WebSocket support, PTY terminal management, AI provider proxy, file system API
 - **Frontend**: Expo (React Native) with expo-router tabs, WebView/iframe xterm.js
-- **Database**: MongoDB for config, chat history
+- **Database**: MongoDB for config, chat history, terminal session persistence
 - **Terminal**: Real Linux PTY shared via WebSocket to multiple clients
 
 ## AI Providers Supported
@@ -50,3 +65,10 @@ TermuxAI is a mobile-first coding and development environment powered by an AI a
 - FastAPI, Python, Motor (async MongoDB)
 - xterm.js 5.3.0 with WebSocket PTY bridge
 - MongoDB for persistence
+
+## APK Build Instructions
+1. Install EAS CLI: `npm install -g eas-cli`
+2. Login: `eas login`
+3. Configure project: `eas build:configure`
+4. Build APK: `eas build --platform android --profile preview`
+5. Download APK from the build URL provided by EAS
