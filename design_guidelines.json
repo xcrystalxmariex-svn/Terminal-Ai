@@ -1,0 +1,277 @@
+{
+  "design_system": {
+    "identity": {
+      "name": "TermuxAI",
+      "vibe": "Cyberpunk Utility",
+      "core_values": [
+        "Raw Power",
+        "Zero Latency",
+        "Dark Mode First",
+        "Hacker Aesthetic"
+      ]
+    },
+    "typography": {
+      "font_family": {
+        "primary": "System",
+        "monospace": "SpaceMono",
+        "headers": "System-Bold"
+      },
+      "scale": {
+        "xs": 12,
+        "sm": 14,
+        "base": 16,
+        "lg": 18,
+        "xl": 20,
+        "2xl": 24,
+        "3xl": 30,
+        "4xl": 36
+      },
+      "weights": {
+        "regular": "400",
+        "medium": "500",
+        "bold": "700",
+        "black": "900"
+      }
+    },
+    "colors": {
+      "themes": {
+        "cyberpunk_void": {
+          "background": "#050505",
+          "surface": "#0F0F0F",
+          "surface_highlight": "#1A1A1A",
+          "primary": "#00FF9C",
+          "secondary": "#FF0055",
+          "text": "#E0E0E0",
+          "text_dim": "#808080",
+          "border": "#333333",
+          "error": "#FF453A",
+          "success": "#32D74B",
+          "warning": "#FFD60A",
+          "info": "#64D2FF"
+        },
+        "monokai_pro": {
+          "background": "#2D2A2E",
+          "surface": "#403E41",
+          "surface_highlight": "#5B595C",
+          "primary": "#FFD866",
+          "secondary": "#FF6188",
+          "text": "#FCFCFA",
+          "text_dim": "#939293",
+          "border": "#727072",
+          "error": "#FF6188",
+          "success": "#A9DC76",
+          "warning": "#FC9867",
+          "info": "#78DCE8"
+        },
+        "dracula": {
+          "background": "#282A36",
+          "surface": "#44475A",
+          "surface_highlight": "#6272A4",
+          "primary": "#BD93F9",
+          "secondary": "#FF79C6",
+          "text": "#F8F8F2",
+          "text_dim": "#6272A4",
+          "border": "#6272A4",
+          "error": "#FF5555",
+          "success": "#50FA7B",
+          "warning": "#F1FA8C",
+          "info": "#8BE9FD"
+        }
+      },
+      "palette": {
+        "black": "#000000",
+        "white": "#FFFFFF",
+        "transparent": "transparent",
+        "overlay": "rgba(0, 0, 0, 0.7)"
+      }
+    },
+    "spacing": {
+      "xs": 4,
+      "sm": 8,
+      "md": 12,
+      "lg": 16,
+      "xl": 24,
+      "2xl": 32,
+      "3xl": 48,
+      "4xl": 64
+    },
+    "borders": {
+      "radius": {
+        "sm": 4,
+        "md": 8,
+        "lg": 12,
+        "full": 9999
+      },
+      "width": {
+        "hairline": 0.5,
+        "thin": 1,
+        "thick": 2
+      }
+    },
+    "shadows": {
+      "sm": {
+        "shadowColor": "#000",
+        "shadowOffset": { "width": 0, "height": 1 },
+        "shadowOpacity": 0.18,
+        "shadowRadius": 1.0,
+        "elevation": 1
+      },
+      "md": {
+        "shadowColor": "#000",
+        "shadowOffset": { "width": 0, "height": 2 },
+        "shadowOpacity": 0.25,
+        "shadowRadius": 3.84,
+        "elevation": 5
+      },
+      "glow_primary": {
+        "shadowColor": "#00FF9C",
+        "shadowOffset": { "width": 0, "height": 0 },
+        "shadowOpacity": 0.5,
+        "shadowRadius": 10,
+        "elevation": 10
+      }
+    },
+    "layout_guidelines": {
+      "safe_area": "Always wrap screen content in SafeAreaView or use useSafeAreaInsets",
+      "keyboard_handling": "Wrap input forms in KeyboardAvoidingView with behavior='padding' on iOS and 'height' on Android",
+      "containers": {
+        "screen": {
+          "flex": 1,
+          "backgroundColor": "theme.background"
+        },
+        "card": {
+          "backgroundColor": "theme.surface",
+          "borderRadius": 12,
+          "padding": 16,
+          "borderWidth": 1,
+          "borderColor": "theme.border"
+        }
+      }
+    },
+    "components": {
+      "Button": {
+        "variants": {
+          "primary": {
+            "backgroundColor": "theme.primary",
+            "paddingVertical": 14,
+            "paddingHorizontal": 24,
+            "borderRadius": 8,
+            "alignItems": "center",
+            "justifyContent": "center"
+          },
+          "secondary": {
+            "backgroundColor": "transparent",
+            "borderWidth": 1,
+            "borderColor": "theme.primary",
+            "paddingVertical": 14,
+            "paddingHorizontal": 24,
+            "borderRadius": 8,
+            "alignItems": "center",
+            "justifyContent": "center"
+          },
+          "ghost": {
+            "backgroundColor": "transparent",
+            "paddingVertical": 12,
+            "paddingHorizontal": 16
+          }
+        },
+        "text_style": {
+          "primary": {
+            "color": "theme.background",
+            "fontWeight": "bold",
+            "fontSize": 16,
+            "textTransform": "uppercase",
+            "letterSpacing": 1
+          },
+          "secondary": {
+            "color": "theme.primary",
+            "fontWeight": "600",
+            "fontSize": 16
+          }
+        }
+      },
+      "Input": {
+        "container": {
+          "backgroundColor": "theme.surface_highlight",
+          "borderRadius": 8,
+          "borderWidth": 1,
+          "borderColor": "theme.border",
+          "paddingHorizontal": 16,
+          "paddingVertical": 12,
+          "flexDirection": "row",
+          "alignItems": "center"
+        },
+        "text": {
+          "color": "theme.text",
+          "fontSize": 16,
+          "fontFamily": "monospace"
+        },
+        "placeholder": "theme.text_dim"
+      },
+      "Terminal": {
+        "container": {
+          "flex": 1,
+          "backgroundColor": "#000000"
+        },
+        "fontFamily": "monospace",
+        "fontSize": 14
+      }
+    },
+    "animations": {
+      "presets": {
+        "fade_in": {
+          "from": { "opacity": 0 },
+          "to": { "opacity": 1 },
+          "duration": 300
+        },
+        "slide_up": {
+          "from": { "translateY": 50, "opacity": 0 },
+          "to": { "translateY": 0, "opacity": 1 },
+          "duration": 400
+        }
+      }
+    },
+    "assets": {
+      "images": {
+        "onboarding_bg_cyber": "https://images.unsplash.com/photo-1643388019606-9173b24bcafb?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwyfHxjeWJlcnB1bmslMjBkaWdpdGFsJTIwYWJzdHJhY3QlMjBiYWNrZ3JvdW5kJTIwZGFya3xlbnwwfHx8fDE3NzM5NDIwOTF8MA&ixlib=rb-4.1.0&q=85",
+        "onboarding_bg_void": "https://images.unsplash.com/photo-1643388019517-cc10ed310a97?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwxfHxjeWJlcnB1bmslMjBkaWdpdGFsJTIwYWJzdHJhY3QlMjBiYWNrZ3JvdW5kJTIwZGFya3xlbnwwfHx8fDE3NzM5NDIwOTF8MA&ixlib=rb-4.1.0&q=85",
+        "setup_bg_squares": "https://images.unsplash.com/photo-1643388019948-0df7123b6aab?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwzfHxjeWJlcnB1bmslMjBkaWdpdGFsJTIwYWJzdHJhY3QlMjBiYWNrZ3JvdW5kJTIwZGFya3xlbnwwfHx8fDE3NzM5NDIwOTF8MA&ixlib=rb-4.1.0&q=85",
+        "logo_placeholder": "https://via.placeholder.com/150/00FF9C/000000?text=TermuxAI"
+      },
+      "icons": {
+        "family": "Ionicons or MaterialCommunityIcons from @expo/vector-icons",
+        "mappings": {
+          "terminal": "terminal",
+          "chat": "chatbubble-ellipses",
+          "settings": "settings-sharp",
+          "play": "play",
+          "stop": "stop",
+          "copy": "copy-outline",
+          "send": "arrow-up-circle"
+        }
+      }
+    },
+    "accessibility": {
+      "contrast_check": "Ensure text contrast ratio > 4.5:1",
+      "touch_targets": "Minimum 44x44 points for all interactive elements",
+      "dynamic_type": "Support text scaling"
+    }
+  },
+  "instructions_to_main_agent": {
+    "styling_strategy": "Use React Native StyleSheet.create. Do NOT use Tailwind CSS classes as NativeWind is not configured. Create a 'src/constants/Theme.js' file to export colors and spacing based on the design_system above.",
+    "theme_implementation": "Implement a ThemeContext to switch between Cyberpunk, Monokai, and Dracula. Store user preference in AsyncStorage.",
+    "component_structure": "Create reusable components in 'src/components/' (e.g., ThemedView, ThemedText, GradientButton).",
+    "navigation": "Use Expo Router. File-based routing in 'app/' directory. Use Tabs for main navigation.",
+    "terminal_integration": "Use 'react-native-webview' to render xterm.js. Bridge communication via injectedJavaScript and onMessage.",
+    "keyboard_handling": "Implement a custom KeyboardAccessoryView for terminal keys (CTRL, ALT, TAB, ESC, Arrows).",
+    "onboarding_flow": "Check for 'is_setup_complete' in AsyncStorage. If false, redirect to '/onboarding'.",
+    "ai_integration": "Store API keys securely using 'expo-secure-store'. Use the configured endpoint for all chat requests."
+  },
+  "universal_guidelines": [
+    "Do not assume Tailwind exists.",
+    "Always check platform (iOS vs Android) for specific UI tweaks (e.g., shadow vs elevation).",
+    "Use 'react-native-safe-area-context' for insets.",
+    "Keep the UI 'snappy' - avoid heavy renders in the terminal loop.",
+    "For the Terminal, use a dark background (#000) regardless of the theme to maintain contrast with colored shell output, or match the theme background if using xterm themes."
+  ]
+}
